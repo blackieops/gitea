@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"code.gitea.io/gitea/models/avatars"
@@ -20,6 +19,7 @@ import (
 	"code.gitea.io/gitea/modules/cache"
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/gitrepo"
+	"code.gitea.io/gitea/modules/globallock"
 	"code.gitea.io/gitea/modules/graceful"
 	"code.gitea.io/gitea/modules/log"
 	api "code.gitea.io/gitea/modules/structs"
@@ -33,7 +33,6 @@ const (
 var (
 	ErrAwaitGeneration  = errors.New("generation took longer than ")
 	awaitGenerationTime = time.Second * 5
-	generateLock        = sync.Map{}
 )
 
 type WeekData struct {
@@ -85,14 +84,16 @@ func GetContributorStats(ctx context.Context, cache cache.StringCache, repo *rep
 		genReady := make(chan struct{})
 
 		// dont start multiple async generations
-		_, run := generateLock.Load(cacheKey)
-		if run {
+		acquired, release, err := globallock.TryLock(ctx, "contributor-stats:"+cacheKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to acquire lock for contributor stats: %w", err)
+		}
+		if !acquired {
 			return nil, ErrAwaitGeneration
 		}
 
-		generateLock.Store(cacheKey, struct{}{})
 		// run generation async
-		go generateContributorStats(genReady, cache, cacheKey, repo, revision)
+		go generateContributorStats(genReady, cache, cacheKey, repo, revision, release)
 
 		select {
 		case <-time.After(awaitGenerationTime):
@@ -199,8 +200,9 @@ func getExtendedCommitStats(repo *git.Repository, revision string /*, limit int 
 	return extendedCommitStats, nil
 }
 
-func generateContributorStats(genDone chan struct{}, cache cache.StringCache, cacheKey string, repo *repo_model.Repository, revision string) {
+func generateContributorStats(genDone chan struct{}, cache cache.StringCache, cacheKey string, repo *repo_model.Repository, revision string, release globallock.ReleaseFunc) {
 	ctx := graceful.GetManager().HammerContext()
+	defer release()
 
 	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
 	if err != nil {
@@ -301,7 +303,6 @@ func generateContributorStats(genDone chan struct{}, cache cache.StringCache, ca
 	}
 
 	_ = cache.PutJSON(cacheKey, contributorsCommitStats, contributorStatsCacheTimeout)
-	generateLock.Delete(cacheKey)
 	if genDone != nil {
 		genDone <- struct{}{}
 	}
